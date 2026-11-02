@@ -1,0 +1,331 @@
+openapi: 3.1.0
+info:
+  title: ModelRail API
+  version: 1.0.0
+  description: Workspace-scoped API for asynchronous task orchestration.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      security: []
+      summary: Liveness check
+      responses:
+        "200":
+          description: HTTP server is alive
+  /readyz:
+    get:
+      security: []
+      summary: Readiness check
+      responses:
+        "200": { description: Database is reachable }
+        "503": { description: Database is unavailable }
+  /v1/tasks:
+    post:
+      summary: Submit a task
+      x-required-scopes: [tasks:write]
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task, input]
+              properties:
+                task: { type: string, minLength: 1, maxLength: 120 }
+                input: { type: string, minLength: 1 }
+                provider: { type: string, enum: [openrouter, mock] }
+                model: { type: string, maxLength: 200, description: OpenRouter model ID }
+                max_attempts: { type: integer, minimum: 1, maximum: 10, default: 3 }
+                temperature: { type: number, minimum: 0, maximum: 2 }
+                max_tokens: { type: integer, minimum: 1, maximum: 32768 }
+                timeout_seconds: { type: integer, minimum: 1, description: Must not exceed the server TASK_TIMEOUT }
+                response_format:
+                  oneOf:
+                    - type: object
+                      required: [type]
+                      properties:
+                        type: { const: json_object }
+                    - type: object
+                      required: [type, json_schema]
+                      properties:
+                        type: { const: json_schema }
+                        json_schema:
+                          type: object
+                          required: [name, schema]
+                          properties:
+                            name: { type: string }
+                            strict: { type: boolean }
+                            schema: { type: object }
+                webhook:
+                  type: object
+                  required: [url, secret]
+                  properties:
+                    url: { type: string, format: uri, description: Public HTTPS callback URL on port 443 }
+                    secret: { type: string, minLength: 16, maxLength: 512, writeOnly: true }
+      responses:
+        "202":
+          description: Task queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TaskAccepted" }
+        "200": { description: Idempotent replay of an existing task }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+    get:
+      summary: List task history
+      x-required-scopes: [tasks:read]
+      parameters:
+        - in: query
+          name: status
+          schema: { $ref: "#/components/schemas/TaskStatus" }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        "200":
+          description: Newest-first task page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TaskPage" }
+        "400": { $ref: "#/components/responses/Error" }
+  /v1/tasks/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      summary: Get a task
+      x-required-scopes: [tasks:read]
+      responses:
+        "200":
+          description: Task detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete a terminal task
+      x-required-scopes: [tasks:delete]
+      responses:
+        "204": { description: Task deleted }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/tasks/{id}/retry:
+    post:
+      summary: Retry a failed task as a new run
+      x-required-scopes: [tasks:manage]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "202":
+          description: Retry queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/tasks/{id}/cancel:
+    post:
+      summary: Cancel an active task
+      x-required-scopes: [tasks:manage]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Cancellation accepted or completed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/api-keys:
+    get:
+      summary: List workspace API keys
+      x-required-scopes: [keys:manage]
+      responses:
+        "200":
+          description: Key metadata; secret tokens are not returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/APIKey" }
+    post:
+      summary: Create a scoped API key
+      x-required-scopes: [keys:manage]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scopes]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100 }
+                scopes:
+                  type: array
+                  minItems: 1
+                  items: { type: string, enum: [admin, tasks:read, tasks:write, tasks:manage, tasks:delete, keys:manage, metrics:read] }
+      responses:
+        "201":
+          description: New token, shown only once
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, token]
+                properties:
+                  key: { $ref: "#/components/schemas/APIKey" }
+                  token: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /v1/api-keys/{id}:
+    delete:
+      summary: Revoke a workspace API key
+      x-required-scopes: [keys:manage]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Key revoked }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/workspaces:
+    post:
+      summary: Create a workspace and its first admin key
+      x-required-scopes: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100 }
+                key_name: { type: string, maxLength: 100 }
+      responses:
+        "201":
+          description: Workspace and initial admin token
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workspace, key, token]
+                properties:
+                  workspace: { $ref: "#/components/schemas/Workspace" }
+                  key: { $ref: "#/components/schemas/APIKey" }
+                  token: { type: string }
+        "403": { $ref: "#/components/responses/Error" }
+  /metrics:
+    get:
+      summary: Prometheus workspace metrics
+      x-required-scopes: [metrics:read]
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema: { type: string }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    Error:
+      description: JSON error response
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error: { type: string }
+  schemas:
+    TaskStatus:
+      type: string
+      enum: [queued, processing, completed, failed, cancelled]
+    TaskAccepted:
+      type: object
+      required: [id, provider, status, status_url]
+      properties:
+        id: { type: string, format: uuid }
+        provider: { type: string }
+        model: { type: string }
+        status: { $ref: "#/components/schemas/TaskStatus" }
+        status_url: { type: string }
+    Task:
+      type: object
+      required: [id, task, provider, status, attempt_count, max_attempts, cancel_requested, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        task: { type: string }
+        provider: { type: string }
+        model: { type: string }
+        status: { $ref: "#/components/schemas/TaskStatus" }
+        attempt_count: { type: integer }
+        max_attempts: { type: integer }
+        temperature: { type: number }
+        max_tokens: { type: integer }
+        timeout_seconds: { type: integer }
+        response_format: { type: object }
+        webhook_url: { type: string }
+        result: { type: [string, "null"] }
+        error_message: { type: [string, "null"] }
+        cancel_requested: { type: boolean }
+        parent_task_id: { type: [string, "null"], format: uuid }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    TaskPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Task" }
+        next_cursor: { type: string }
+    APIKey:
+      type: object
+      required: [id, name, prefix, scopes, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: [string, "null"], format: date-time }
+    Workspace:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
